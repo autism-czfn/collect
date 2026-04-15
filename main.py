@@ -69,10 +69,12 @@ app.add_middleware(
 from routes.logs import router as logs_router
 from routes.interventions import router as interventions_router
 from routes.summaries import router as summaries_router
+from routes.daily_checks import router as daily_checks_router
 
 app.include_router(logs_router)
 app.include_router(interventions_router)
 app.include_router(summaries_router)
+app.include_router(daily_checks_router)
 
 # ── Existing endpoints (unchanged) ─────────────────────────────────────────────
 

@@ -164,17 +164,72 @@ run_migration() {
         echo ""
         return
     fi
-    local sql="$SCRIPT_DIR/migrations/001_create_tables.sql"
-    if [ ! -f "$sql" ]; then
-        echo "  ❌  Migration file not found: $sql"
+
+    local migrations_dir="$SCRIPT_DIR/migrations"
+    local files
+    files=$(ls "$migrations_dir"/*.sql 2>/dev/null | sort)
+    if [ -z "$files" ]; then
+        echo "  ❌  No migration files found in $migrations_dir"
         echo ""
         return
     fi
-    echo "  🗄️   Running DB migration against: $dsn"
-    if psql "$dsn" -f "$sql"; then
-        echo "  ✅  Migration complete"
+
+    # Parse DSN components so PGPASSWORD is always set explicitly
+    local db_user db_pass db_host db_port db_name
+    db_user=$(echo "$dsn" | sed -E 's|postgresql://([^:@]+).*|\1|')
+    db_pass=$(echo "$dsn" | sed -E 's|postgresql://[^:]+:([^@]*)@.*|\1|')
+    db_host=$(echo "$dsn" | sed -E 's|.*@([^:/]+)[:/].*|\1|')
+    db_port=$(echo "$dsn" | sed -E 's|.*:([0-9]+)/.*|\1|')
+    db_name=$(echo "$dsn" | sed -E 's|.*/([^/]+)$|\1|')
+
+    # psql shorthand reused for all calls
+    _psql() { PGPASSWORD="$db_pass" psql -h "$db_host" -p "$db_port" -U "$db_user" "$@"; }
+
+    # Ensure the target database exists
+    printf "      %-45s " "database '$db_name'"
+    if _psql -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null | grep -q 1; then
+        echo "✅  (exists)"
     else
-        echo "  ❌  Migration failed — check psql output above"
+        # Try as dbuser first; fall back to postgres superuser via peer auth
+        local created=0
+        if _psql -d postgres -c "CREATE DATABASE \"$db_name\"" > /dev/null 2>&1; then
+            created=1
+        elif sudo -u postgres psql -c "CREATE DATABASE \"$db_name\"" > /dev/null 2>&1; then
+            created=1
+            # Grant schema privileges so dbuser can create tables
+            sudo -u postgres psql -d "$db_name" \
+                -c "GRANT ALL ON SCHEMA public TO \"$db_user\"" > /dev/null 2>&1
+        fi
+        if [ "$created" -eq 1 ]; then
+            echo "✅  (created)"
+        else
+            echo "❌"
+            sudo -u postgres psql -c "CREATE DATABASE \"$db_name\"" 2>&1 | sed 's/^/        /'
+            echo ""
+            echo "  ❌  Cannot create database — aborting migrations"
+            echo ""
+            return
+        fi
+    fi
+
+    echo "  🗄️   Running DB migrations against: $dsn"
+    local failed=0
+    for sql in $files; do
+        printf "      %-45s " "$(basename "$sql")"
+        if _psql -d "$db_name" -f "$sql" > /dev/null 2>&1; then
+            echo "✅"
+        else
+            echo "❌"
+            failed=1
+            _psql -d "$db_name" -f "$sql" 2>&1 | sed 's/^/        /'
+        fi
+    done
+
+    echo ""
+    if [ "$failed" -eq 0 ]; then
+        echo "  ✅  All migrations complete"
+    else
+        echo "  ❌  One or more migrations failed — see output above"
     fi
     echo ""
 }

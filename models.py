@@ -109,3 +109,70 @@ class SummaryRead(BaseModel):
     summary_text: str
     stats_json: dict[str, Any]
     generated_at: datetime
+
+
+# ── Daily Checks ───────────────────────────────────────────────────────────────
+
+VALID_RATING_KEYS: frozenset[str] = frozenset({
+    "sleep_quality", "mood", "sensory_sensitivity", "appetite",
+    "social_tolerance", "routine_adherence", "communication_ease",
+    "physical_activity", "caregiver_rating", "meltdown_count",
+})
+
+RATING_1_5_KEYS: frozenset[str] = VALID_RATING_KEYS - {"meltdown_count"}
+
+
+class DailyCheckCreate(BaseModel):
+    check_date: date
+    ratings: dict[str, int]
+    notes: str | None = None
+
+    @field_validator("check_date")  # mode="after" (default) — value is a date object
+    @classmethod
+    def not_in_future(cls, v: date) -> date:
+        if v > date.today():
+            raise ValueError("check_date cannot be in the future")
+        return v
+
+    @field_validator("ratings", mode="before")  # raw dict before Pydantic coercion
+    @classmethod
+    def validate_ratings(cls, v: Any) -> Any:
+        if not isinstance(v, dict):
+            raise ValueError("ratings must be an object")
+        missing = VALID_RATING_KEYS - v.keys()
+        if missing:
+            raise ValueError(f"ratings missing required keys: {sorted(missing)}")
+        extra = v.keys() - VALID_RATING_KEYS
+        if extra:
+            raise ValueError(f"ratings contains unknown keys: {sorted(extra)}")
+        for key in RATING_1_5_KEYS:
+            val = v[key]
+            if not isinstance(val, int) or not (1 <= val <= 5):
+                raise ValueError(f"ratings.{key} must be an integer between 1 and 5")
+        mc = v["meltdown_count"]
+        if not isinstance(mc, int) or mc < 0:
+            raise ValueError("ratings.meltdown_count must be an integer >= 0")
+        return v
+
+    @field_validator("notes")  # mode="after" (default)
+    @classmethod
+    def notes_length(cls, v: str | None) -> str | None:
+        if v is not None and len(v) > 5000:
+            raise ValueError("notes exceeds 5000 chars")
+        return v
+
+
+class DailyCheckRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    check_date: date
+    ratings: dict[str, int]
+    notes: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class DailyChecksResponse(BaseModel):
+    checks: list[DailyCheckRead]
+    total: int
