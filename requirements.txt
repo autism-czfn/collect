@@ -2,3 +2,6 @@ faster-whisper
 fastapi
 uvicorn[standard]
 python-multipart
+python-dotenv
+asyncpg
+pydantic
