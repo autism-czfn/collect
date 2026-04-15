@@ -245,7 +245,7 @@ async def _save_to_db(
                 updated_at = now()
             """,
             log_date,
-            json.dumps(ratings),
+            ratings,
             mapped.checkin_notes,
         )
 
