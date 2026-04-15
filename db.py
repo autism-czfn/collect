@@ -3,11 +3,13 @@ import logging
 import os
 import sys
 
+from typing import Optional
+
 import asyncpg
 
 log = logging.getLogger(__name__)
 
-_pool: asyncpg.Pool | None = None
+_pool: Optional[asyncpg.Pool] = None
 
 
 async def _init_connection(conn: asyncpg.Connection) -> None:

@@ -25,8 +25,8 @@ async def create_daily_check(body: DailyCheckCreate):
             INSERT INTO mzhu_test_daily_checks (check_date, ratings, notes)
             VALUES ($1, $2, $3)
             ON CONFLICT (check_date) DO UPDATE SET
-                ratings    = EXCLUDED.ratings,
-                notes      = EXCLUDED.notes,
+                ratings    = mzhu_test_daily_checks.ratings || EXCLUDED.ratings,
+                notes      = COALESCE(EXCLUDED.notes, mzhu_test_daily_checks.notes),
                 updated_at = now()
             RETURNING *
             """,

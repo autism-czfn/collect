@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
@@ -34,19 +34,17 @@ KEY      = CERT_DIR / "key.pem"
 logging.basicConfig(level=logging.INFO, format="  %(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Load Whisper model once at startup ─────────────────────────────────────────
-log.info(f"Loading faster-whisper model '{WHISPER_MODEL}' …")
-from faster_whisper import WhisperModel
-model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-log.info("Model ready.")
-
-# ── DB pool lifespan ───────────────────────────────────────────────────────────
+# ── DB pool + Whisper lifespan ─────────────────────────────────────────────────
 import db as _db
+from faster_whisper import WhisperModel
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await _db.create_pool()
+    log.info(f"Loading faster-whisper model '{WHISPER_MODEL}' …")
+    app.state.whisper_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+    log.info("Model ready.")
     yield
     await _db.close_pool()
 
@@ -70,11 +68,13 @@ from routes.logs import router as logs_router
 from routes.interventions import router as interventions_router
 from routes.summaries import router as summaries_router
 from routes.daily_checks import router as daily_checks_router
+from routes.transcribe_and_log import router as tal_router
 
 app.include_router(logs_router)
 app.include_router(interventions_router)
 app.include_router(summaries_router)
 app.include_router(daily_checks_router)
+app.include_router(tal_router)
 
 # ── Existing endpoints (unchanged) ─────────────────────────────────────────────
 
@@ -84,7 +84,7 @@ def health():
 
 
 @app.post("/transcribe")
-async def transcribe(audio: UploadFile = File(...)):
+async def transcribe(request: Request, audio: UploadFile = File(...)):
     """
     Accept an audio file (webm, ogg, wav, mp4, m4a …) and return transcribed text.
     ffmpeg handles all format conversions automatically.
@@ -100,7 +100,8 @@ async def transcribe(audio: UploadFile = File(...)):
         tmp_path = tmp.name
 
     try:
-        segments, info = model.transcribe(
+        whisper = request.app.state.whisper_model
+        segments, info = whisper.transcribe(
             tmp_path,
             language=WHISPER_LANG,
             beam_size=5,
