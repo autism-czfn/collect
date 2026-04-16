@@ -101,6 +101,139 @@ stop_service() {
     echo ""
 }
 
+configure_env() {
+    echo ""
+    echo "  Configure environment (.env)"
+    echo "  ─────────────────────────────────"
+
+    # Read existing values as defaults
+    local cur_url
+    cur_url=$(grep -E '^USER_DATABASE_URL=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)
+
+    # Parse existing DSN if present
+    local def_host="localhost" def_port="5432" def_db="mzhu_test_autism_users" def_user="dbuser" def_pass=""
+    if [ -n "$cur_url" ]; then
+        # postgresql://user:pass@host:port/db
+        def_user=$(echo "$cur_url" | sed -E 's|postgresql://([^:@]+).*|\1|')
+        def_pass=$(echo "$cur_url" | sed -E 's|postgresql://[^:]+:([^@]*)@.*|\1|')
+        def_host=$(echo "$cur_url" | sed -E 's|.*@([^:/]+)[:/].*|\1|')
+        def_port=$(echo "$cur_url" | sed -E 's|.*:([0-9]+)/.*|\1|')
+        def_db=$(echo "$cur_url"   | sed -E 's|.*/([^/]+)$|\1|')
+    fi
+
+    local cur_port cur_model cur_lang
+    cur_port=$(grep -E '^PORT='            "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)
+    cur_model=$(grep -E '^WHISPER_MODEL='  "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)
+    cur_lang=$(grep  -E '^WHISPER_LANGUAGE=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)
+
+    local def_api_port="${cur_port:-18001}"
+    local def_model="${cur_model:-base}"
+    local def_lang="${cur_lang:-}"
+
+    printf "  DB host     [%s]: " "$def_host";  read -r inp; DB_HOST="${inp:-$def_host}"
+    printf "  DB port     [%s]: " "$def_port";  read -r inp; DB_PORT="${inp:-$def_port}"
+    printf "  DB name     [%s]: " "$def_db";    read -r inp; DB_NAME="${inp:-$def_db}"
+    printf "  DB user     [%s]: " "$def_user";  read -r inp; DB_USER="${inp:-$def_user}"
+    printf "  DB password [%s]: " "${def_pass:+(set)}"; read -rs inp; echo
+    DB_PASS="${inp:-$def_pass}"
+    printf "  API port    [%s]: " "$def_api_port"; read -r inp; API_PORT="${inp:-$def_api_port}"
+    printf "  Whisper model [%s]: " "$def_model"; read -r inp; W_MODEL="${inp:-$def_model}"
+    printf "  Whisper language (blank=auto) [%s]: " "$def_lang"; read -r inp; W_LANG="${inp:-$def_lang}"
+
+    local dsn="postgresql://${DB_USER}:${DB_PASS}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
+
+    {
+        echo "USER_DATABASE_URL=${dsn}"
+        echo "PORT=${API_PORT}"
+        echo "WHISPER_MODEL=${W_MODEL}"
+        [ -n "$W_LANG" ] && echo "WHISPER_LANGUAGE=${W_LANG}"
+    } > "$SCRIPT_DIR/.env"
+
+    echo ""
+    echo "  ✅  .env written"
+    echo "  🔗  DSN: ${dsn}"
+    echo ""
+}
+
+run_migration() {
+    echo ""
+    local dsn
+    dsn=$(grep -E '^USER_DATABASE_URL=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]')
+    if [ -z "$dsn" ]; then
+        echo "  ❌  USER_DATABASE_URL not found in .env — cannot run migration"
+        echo ""
+        return
+    fi
+
+    local migrations_dir="$SCRIPT_DIR/migrations"
+    local files
+    files=$(ls "$migrations_dir"/*.sql 2>/dev/null | sort)
+    if [ -z "$files" ]; then
+        echo "  ❌  No migration files found in $migrations_dir"
+        echo ""
+        return
+    fi
+
+    # Parse DSN components so PGPASSWORD is always set explicitly
+    local db_user db_pass db_host db_port db_name
+    db_user=$(echo "$dsn" | sed -E 's|postgresql://([^:@]+).*|\1|')
+    db_pass=$(echo "$dsn" | sed -E 's|postgresql://[^:]+:([^@]*)@.*|\1|')
+    db_host=$(echo "$dsn" | sed -E 's|.*@([^:/]+)[:/].*|\1|')
+    db_port=$(echo "$dsn" | sed -E 's|.*:([0-9]+)/.*|\1|')
+    db_name=$(echo "$dsn" | sed -E 's|.*/([^/]+)$|\1|')
+
+    # psql shorthand reused for all calls
+    _psql() { PGPASSWORD="$db_pass" psql -h "$db_host" -p "$db_port" -U "$db_user" "$@"; }
+
+    # Ensure the target database exists
+    printf "      %-45s " "database '$db_name'"
+    if _psql -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null | grep -q 1; then
+        echo "✅  (exists)"
+    else
+        # Try as dbuser first; fall back to postgres superuser via peer auth
+        local created=0
+        if _psql -d postgres -c "CREATE DATABASE \"$db_name\"" > /dev/null 2>&1; then
+            created=1
+        elif sudo -u postgres psql -c "CREATE DATABASE \"$db_name\"" > /dev/null 2>&1; then
+            created=1
+            # Grant schema privileges so dbuser can create tables
+            sudo -u postgres psql -d "$db_name" \
+                -c "GRANT ALL ON SCHEMA public TO \"$db_user\"" > /dev/null 2>&1
+        fi
+        if [ "$created" -eq 1 ]; then
+            echo "✅  (created)"
+        else
+            echo "❌"
+            sudo -u postgres psql -c "CREATE DATABASE \"$db_name\"" 2>&1 | sed 's/^/        /'
+            echo ""
+            echo "  ❌  Cannot create database — aborting migrations"
+            echo ""
+            return
+        fi
+    fi
+
+    echo "  🗄️   Running DB migrations against: $dsn"
+    local failed=0
+    for sql in $files; do
+        printf "      %-45s " "$(basename "$sql")"
+        if _psql -d "$db_name" -f "$sql" > /dev/null 2>&1; then
+            echo "✅"
+        else
+            echo "❌"
+            failed=1
+            _psql -d "$db_name" -f "$sql" 2>&1 | sed 's/^/        /'
+        fi
+    done
+
+    echo ""
+    if [ "$failed" -eq 0 ]; then
+        echo "  ✅  All migrations complete"
+    else
+        echo "  ❌  One or more migrations failed — see output above"
+    fi
+    echo ""
+}
+
 service_status() {
     echo ""
     local pid
@@ -155,11 +288,13 @@ service_status() {
 
 while true; do
     echo "╔══════════════════════════════════════╗"
-    echo "║    Voice Transcription Service       ║"
+    echo "║       Collect Service                ║"
     echo "╠══════════════════════════════════════╣"
     echo "║  1) Start / Restart service          ║"
     echo "║  2) Stop service                     ║"
     echo "║  3) Service status                   ║"
+    echo "║  4) Run DB migration                 ║"
+    echo "║  5) Configure environment (.env)     ║"
     echo "║  0) Exit                             ║"
     echo "╚══════════════════════════════════════╝"
     printf "  Choose an option: "
@@ -169,6 +304,8 @@ while true; do
         1) start_service  ;;
         2) stop_service   ;;
         3) service_status ;;
+        4) run_migration  ;;
+        5) configure_env  ;;
         0) echo ""; echo "  Bye!"; echo ""; exit 0 ;;
         *) echo ""; echo "  ⚠️  Invalid option"; echo "" ;;
     esac
