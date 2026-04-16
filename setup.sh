@@ -6,6 +6,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAIN="$SCRIPT_DIR/main.py"
 LOGFILE="$SCRIPT_DIR/collect.log"
 PYTHON="/home/test/.virtualenvs/collect/bin/python3"
+PIP="/home/test/.virtualenvs/collect/bin/pip"
+REQUIREMENTS="$SCRIPT_DIR/requirements.txt"
 
 # Load PORT from .env (fallback to default)
 PORT=$(grep -E '^PORT=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')
@@ -284,6 +286,27 @@ service_status() {
     echo ""
 }
 
+install_requirements() {
+    echo ""
+    if [ ! -f "$REQUIREMENTS" ]; then
+        echo "  ❌  requirements.txt not found at $REQUIREMENTS"
+        echo ""
+        return
+    fi
+    if [ ! -x "$PIP" ]; then
+        echo "  ❌  pip not found at $PIP"
+        echo ""
+        return
+    fi
+    echo "  📦  Installing requirements from $REQUIREMENTS..."
+    if "$PIP" install -r "$REQUIREMENTS"; then
+        echo "  ✅  Requirements installed"
+    else
+        echo "  ❌  Failed to install requirements"
+    fi
+    echo ""
+}
+
 # ── Menu ───────────────────────────────────────────────────────────────────────
 
 while true; do
@@ -295,17 +318,19 @@ while true; do
     echo "║  3) Service status                   ║"
     echo "║  4) Run DB migration                 ║"
     echo "║  5) Configure environment (.env)     ║"
+    echo "║  6) Install requirements             ║"
     echo "║  0) Exit                             ║"
     echo "╚══════════════════════════════════════╝"
     printf "  Choose an option: "
     read -r choice
 
     case "$choice" in
-        1) start_service  ;;
-        2) stop_service   ;;
-        3) service_status ;;
-        4) run_migration  ;;
-        5) configure_env  ;;
+        1) start_service         ;;
+        2) stop_service          ;;
+        3) service_status        ;;
+        4) run_migration         ;;
+        5) configure_env         ;;
+        6) install_requirements  ;;
         0) echo ""; echo "  Bye!"; echo ""; exit 0 ;;
         *) echo ""; echo "  ⚠️  Invalid option"; echo "" ;;
     esac
