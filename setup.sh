@@ -25,8 +25,9 @@ get_local_ip() {
 # ── Process helpers ────────────────────────────────────────────────────────────
 
 service_pid() {
-    # Find PID of the venv python process running our exact main.py path
-    pgrep -f "$PYTHON $MAIN" | head -1
+    # Find PID of whatever is listening on our PORT.
+    # PORT is loaded from .env (line 13), so it always matches the running service.
+    lsof -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1
 }
 
 is_running() {
