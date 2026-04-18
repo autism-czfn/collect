@@ -17,18 +17,18 @@ from datetime import date, datetime
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
+from routes.safety_webhook import fire_safety_webhook
 
 from db import get_pool
 from models import MappedFields, TranscribeAndLogResponse
+from trigger_vocab import CANONICAL_TRIGGERS, normalize_trigger, is_known
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["transcribe-and-log"])
 
-KNOWN_TRIGGERS = frozenset({
-    "noise", "transitions", "sleep", "food", "social",
-    "screens", "routine-change", "other",
-})
+# KNOWN_TRIGGERS now loaded from config/triggers.json via trigger_vocab module
+KNOWN_TRIGGERS = CANONICAL_TRIGGERS
 
 KNOWN_TAGS = frozenset({
     "public_place", "sensory", "home", "school",
@@ -44,19 +44,41 @@ RATING_KEYS = frozenset({
 EXTRACTION_SYSTEM_PROMPT = """\
 You are an assistant that extracts structured data from caregiver spoken notes about a child's day.
 
+The caregiver may speak in ANY language (English, Chinese, Japanese, French, etc.). \
+Regardless of input language, ALL output field values MUST be in English. \
+Translate behavioral descriptions into standard English clinical/behavioral terms.
+
 Extract ONLY the fields that are explicitly mentioned. Return null for fields not mentioned. \
 Do not infer or guess values not stated.
 
+CRITICAL — trigger mapping rules (use the most specific term that fits):
+  - Fighting, hitting, kicking, biting, throwing objects, 打架, 暴力, 打人, 攻击 → "aggression"
+  - Self-injury, head banging, self-biting, 自伤, 自残, 撞头 → "self_harm"
+  - Suicide, suicidal, kill himself, 自杀, 想死, 不想活 → "self_harm"
+  - Running away, bolting, wandering off, 走失, 跑掉 → "elopement"
+  - Worry, panic, fear, 焦虑, 不安 → "anxiety"
+  - Refusing demands, task avoidance → "demand_avoidance"
+  - Do NOT map violence/aggression to "social". "social" is for non-violent peer interaction difficulties only.
+
+CRITICAL — raw_signals extraction:
+  For EVERY trigger you extract, ALSO extract the EXACT original phrase from the input that led to it.
+  Keep the original language (Chinese, English, etc.). Do NOT translate raw_signals.
+  Examples:
+    Input: "孩子说不想活了" → triggers: ["self_harm"], raw_signals: ["不想活了"]
+    Input: "kid wants to kill himself" → triggers: ["self_harm"], raw_signals: ["kill himself"]
+    Input: "hitting teacher and ran away" → triggers: ["aggression", "elopement"], raw_signals: ["hitting teacher", "ran away"]
+
 Return a single JSON object with exactly these fields:
 {
-  "event": string or null,
-  "triggers": array of strings (only from: noise, transitions, sleep, food, social, screens, routine-change, other),
-  "context": string or null,
-  "response": string or null,
-  "outcome": string or null,
+  "event": string or null (in English),
+  "triggers": array of strings (only from: noise, transitions, sleep, food, social, screens, routine_change, crowd, sensory_overload, school_stress, aggression, self_harm, elopement, anxiety, demand_avoidance, other),
+  "raw_signals": array of strings (exact original phrases from input, in original language, one per trigger),
+  "context": string or null (in English),
+  "response": string or null (in English),
+  "outcome": string or null (in English),
   "severity": integer 1-5 or null,
   "tags": array of strings (only from: public_place, sensory, home, school, evening, morning, after-therapy),
-  "notes": string or null,
+  "notes": string or null (in English),
   "sleep_quality": integer 1-5 or null,
   "mood": integer 1-5 or null,
   "sensory_sensitivity": integer 1-5 or null,
@@ -67,7 +89,7 @@ Return a single JSON object with exactly these fields:
   "communication_ease": integer 1-5 or null,
   "physical_activity": integer 1-5 or null,
   "caregiver_rating": integer 1-5 or null,
-  "checkin_notes": string or null
+  "checkin_notes": string or null (in English)
 }
 
 Return ONLY valid JSON. No explanation, no markdown, no code fences.\
@@ -106,8 +128,29 @@ def _validate_mapped(raw: dict) -> MappedFields:
     raw_triggers = raw.get("triggers") or []
     if not isinstance(raw_triggers, list):
         raw_triggers = []
-    good_triggers = [t for t in raw_triggers if t in KNOWN_TRIGGERS]
-    bad_triggers  = [t for t in raw_triggers if t not in KNOWN_TRIGGERS]
+    # Normalize through shared vocabulary (resolve aliases, hyphen→underscore)
+    normalized = [normalize_trigger(t) for t in raw_triggers]
+    good_triggers = [t for t in normalized if is_known(t)]
+    bad_triggers  = [t for t in normalized if not is_known(t)]
+
+    # ── severity-trigger consistency: scan event/context for missed signals ──
+    severity = raw.get("severity")
+    event_text = ((raw.get("event") or "") + " " + (raw.get("context") or "")).lower()
+    _AGGRESSION_HINTS = {"暴力", "打架", "打人", "攻击", "攻擊", "咬人", "踢人",
+                         "fight", "hit", "kick", "bite", "violen", "aggress"}
+    _SELF_HARM_HINTS = {"自伤", "自傷", "自残", "自殘", "撞头",
+                        "self harm", "self-harm", "self injury", "head bang"}
+    _ELOPEMENT_HINTS = {"走失", "跑掉", "bolting", "ran away", "running away", "elope"}
+
+    if "aggression" not in good_triggers and any(h in event_text for h in _AGGRESSION_HINTS):
+        good_triggers.append("aggression")
+        log.info("severity-trigger fix: added 'aggression' from event/context text")
+    if "self_harm" not in good_triggers and any(h in event_text for h in _SELF_HARM_HINTS):
+        good_triggers.append("self_harm")
+        log.info("severity-trigger fix: added 'self_harm' from event/context text")
+    if "elopement" not in good_triggers and any(h in event_text for h in _ELOPEMENT_HINTS):
+        good_triggers.append("elopement")
+        log.info("severity-trigger fix: added 'elopement' from event/context text")
 
     # ── tags ──────────────────────────────────────────────────────────────────
     raw_tags = raw.get("tags") or []
@@ -129,9 +172,16 @@ def _validate_mapped(raw: dict) -> MappedFields:
         extra = "; ".join(overflow)
         notes = f"{notes} [{extra}]" if notes else f"[{extra}]"
 
+    # Extract raw_signals from LLM output (preserves original language)
+    raw_signals = raw.get("raw_signals") or []
+    if not isinstance(raw_signals, list):
+        raw_signals = []
+    raw_signals = [str(s).strip() for s in raw_signals if s and str(s).strip()]
+
     return MappedFields(
         event=raw.get("event") or None,
         triggers=good_triggers,
+        raw_signals=raw_signals,
         context=raw.get("context") or None,
         response=raw.get("response") or None,
         outcome=raw.get("outcome") or None,
@@ -204,14 +254,15 @@ async def _save_to_db(
         row = await conn.fetchrow(
             """
             INSERT INTO mzhu_test_logs
-                (child_id, event, triggers, context, response,
+                (child_id, event, triggers, raw_signals, context, response,
                  outcome, severity, tags, notes, intervention_ids)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             RETURNING id, logged_at
             """,
             child_id,
             mapped.event,
             mapped.triggers,
+            mapped.raw_signals,
             mapped.context,
             mapped.response,
             mapped.outcome,
@@ -222,6 +273,17 @@ async def _save_to_db(
         )
         log_id    = row["id"]
         logged_at = row["logged_at"]
+
+        # P3.1: Fire safety webhook on voice-logged events
+        # Pass both the raw transcription AND event text for intent detection
+        fire_safety_webhook(
+            child_id=child_id,
+            triggers=mapped.triggers or [],
+            severity=mapped.severity,
+            tags=mapped.tags or [],
+            logged_at=logged_at,
+            event_text=f"{transcription} {mapped.event or ''}",
+        )
 
     # ── daily check-in ────────────────────────────────────────────────────────
     ratings = {
@@ -321,10 +383,26 @@ async def transcribe_and_log(
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or "claude -p exited non-zero")
         raw_text = result.stdout.strip()
-        # Strip markdown code fences if Claude wraps the JSON
-        if raw_text.startswith("```"):
-            raw_text = raw_text[raw_text.index("\n") + 1:]  # drop ```json line
-            raw_text = raw_text[:raw_text.rfind("```")].strip()  # drop closing ```
+        # Strip markdown code fences if Claude wraps the JSON.
+        # Handles both "```json\n{...}\n```" at the start AND cases where
+        # Claude adds preamble text before the fenced block.
+        if "```" in raw_text:
+            # Find the first opening fence
+            fence_start = raw_text.index("```")
+            after_fence = raw_text[fence_start + 3:]
+            # Skip the language tag line (e.g. "json\n")
+            if "\n" in after_fence:
+                after_fence = after_fence[after_fence.index("\n") + 1:]
+            # Find the closing fence
+            if "```" in after_fence:
+                after_fence = after_fence[:after_fence.rfind("```")].strip()
+            raw_text = after_fence
+        # Handle case where Claude outputs text before/after bare JSON
+        else:
+            brace_start = raw_text.find("{")
+            brace_end = raw_text.rfind("}")
+            if brace_start != -1 and brace_end != -1:
+                raw_text = raw_text[brace_start:brace_end + 1]
         raw_dict = json.loads(raw_text)
     except json.JSONDecodeError as e:
         log.error(f"LLM returned invalid JSON: {e}\nRaw: {raw_text!r}")

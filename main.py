@@ -69,12 +69,19 @@ from routes.interventions import router as interventions_router
 from routes.summaries import router as summaries_router
 from routes.daily_checks import router as daily_checks_router
 from routes.transcribe_and_log import router as tal_router
+from routes.triggers import router as triggers_router
+from routes.trigger_signals import router as trigger_signals_router
 
+# trigger_signals_router MUST be registered before logs_router:
+# /logs/trigger-signals (static) must match before /logs/{log_id} (parameterized),
+# otherwise FastAPI returns 422 trying to parse "trigger-signals" as UUID.
+app.include_router(trigger_signals_router)
 app.include_router(logs_router)
 app.include_router(interventions_router)
 app.include_router(summaries_router)
 app.include_router(daily_checks_router)
 app.include_router(tal_router)
+app.include_router(triggers_router)
 
 # ── Existing endpoints (unchanged) ─────────────────────────────────────────────
 

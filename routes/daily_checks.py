@@ -1,4 +1,5 @@
-import json
+from __future__ import annotations
+
 from datetime import date
 from typing import Annotated
 
@@ -31,7 +32,7 @@ async def create_daily_check(body: DailyCheckCreate):
             RETURNING *
             """,
             body.check_date,
-            json.dumps(body.ratings),
+            body.ratings,          # Pass raw dict — db.py JSONB codec handles serialization
             body.notes,
         )
     return _row_to_check(row)

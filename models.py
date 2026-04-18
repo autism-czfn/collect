@@ -14,6 +14,7 @@ class LogCreate(BaseModel):
     logged_at: datetime | None = None          # None → server uses now()
     event: str | None = Field(None, max_length=2000)
     triggers: list[str] = Field(default_factory=list)
+    raw_signals: list[str] = Field(default_factory=list)
     context: str | None = Field(None, max_length=5000)
     response: str | None = Field(None, max_length=5000)
     outcome: str | None = None
@@ -58,6 +59,12 @@ class LogUpdate(BaseModel):
     notes: str | None = None
 
 
+class FieldWarning(BaseModel):
+    field: str
+    message: str
+    value: str
+
+
 class LogRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -66,6 +73,7 @@ class LogRead(BaseModel):
     logged_at: datetime
     event: str | None
     triggers: list[str]
+    raw_signals: list[str] = Field(default_factory=list)
     context: str | None
     response: str | None
     outcome: str | None
@@ -75,6 +83,15 @@ class LogRead(BaseModel):
     notes: str | None
     voided: bool
     voided_at: datetime | None
+    # Computed enrichment fields (set by API, not stored in DB)
+    time_of_day: str | None = None
+    environment: str | None = None
+
+
+class LogCreateResponse(BaseModel):
+    """POST /logs response — includes warnings for unknown triggers."""
+    log: LogRead
+    warnings: list[FieldWarning] = []
 
 
 class LogsResponse(BaseModel):
@@ -213,6 +230,7 @@ class MappedFields(BaseModel):
     # Event log fields
     event: str | None = None
     triggers: list[str] = Field(default_factory=list)
+    raw_signals: list[str] = Field(default_factory=list)
     context: str | None = None
     response: str | None = None
     outcome: str | None = None
