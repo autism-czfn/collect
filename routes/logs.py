@@ -162,7 +162,14 @@ async def list_logs(
     days: Annotated[int, Query(ge=1)] = 30,
     limit: Annotated[int, Query(ge=1, le=1000)] = 200,
     include_voided: bool = False,
+    offset: Annotated[int, Query(ge=0)] = 0,
 ):
+    """List logs within a rolling time window.
+
+    For today's entry pre-load: pass days=2, offset=0.
+    For history pagination (P-UI-7): omit days (uses default 30) and
+    increment offset by limit on each "Load more" request.
+    """
     pool = get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -172,11 +179,12 @@ async def list_logs(
             WHERE logged_at >= now() - $1 * interval '1 day'
               AND (NOT voided OR $2)
             ORDER BY logged_at DESC
-            LIMIT $3
+            LIMIT $3 OFFSET $4
             """,
             days,
             include_voided,
             limit,
+            offset,
         )
     total = rows[0]["_total"] if rows else 0
     return LogsResponse(logs=[_row_to_log(r) for r in rows], total=total)
@@ -200,6 +208,11 @@ async def update_log(log_id: uuid.UUID, body: LogUpdate):
     """Update a log entry. Only supplied non-None fields are written;
     existing values are preserved for omitted fields (COALESCE).
     MVP: a field cannot be explicitly cleared back to null via this endpoint."""
+    # Normalize triggers the same way POST /logs does — alias resolution included.
+    normalized_triggers: list[str] | None = None
+    if body.triggers is not None:
+        normalized_triggers, _ = _normalize_triggers(body.triggers)
+
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -223,7 +236,7 @@ async def update_log(log_id: uuid.UUID, body: LogUpdate):
             body.child_id,
             body.logged_at,
             body.event,
-            body.triggers,
+            normalized_triggers,
             body.context,
             body.response,
             body.outcome,
