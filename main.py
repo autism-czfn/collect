@@ -41,6 +41,9 @@ from faster_whisper import WhisperModel
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # P-COL-3: warn at startup if safety webhooks are disabled
+    if not os.getenv("SEARCH_WEBHOOK_URL"):
+        log.warning("SEARCH_WEBHOOK_URL not set — safety webhooks DISABLED")
     await _db.create_pool()
     log.info(f"Loading faster-whisper model '{WHISPER_MODEL}' …")
     app.state.whisper_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
@@ -71,6 +74,8 @@ from routes.daily_checks import router as daily_checks_router
 from routes.transcribe_and_log import router as tal_router
 from routes.triggers import router as triggers_router
 from routes.trigger_signals import router as trigger_signals_router
+from routes.user_settings import router as user_settings_router
+from routes.admin import router as admin_router
 
 # trigger_signals_router MUST be registered before logs_router:
 # /logs/trigger-signals (static) must match before /logs/{log_id} (parameterized),
@@ -82,6 +87,12 @@ app.include_router(summaries_router)
 app.include_router(daily_checks_router)
 app.include_router(tal_router)
 app.include_router(triggers_router)
+# nginx strips /collect/ before proxying to this backend (trailing slash on proxy_pass).
+# All other routers use their own prefix (e.g. /logs, /interventions) with no external
+# prefix — user_settings follows the same pattern: exposes /user-settings, which nginx
+# reaches via /collect/user-settings.
+app.include_router(user_settings_router)
+app.include_router(admin_router)
 
 # ── Existing endpoints (unchanged) ─────────────────────────────────────────────
 

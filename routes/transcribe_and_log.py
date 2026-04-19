@@ -1,10 +1,14 @@
 """
-POST /transcribe-and-log
+POST /transcribe-and-log  (P-COL-5 / P-UI-3)
 
 Accepts an audio blob, transcribes it with Whisper, extracts structured
-fields via LLM, conditionally saves to mzhu_test_logs and/or
-mzhu_test_daily_checks, and returns the saved entry details plus
-pre-fill data for the UI.
+fields via LLM, and returns the extraction result for caregiver review.
+
+DECISION LOCKED — EXTRACT ONLY: this endpoint does NOT write to the DB.
+After the caregiver reviews and edits the extracted fields, the UI must
+POST confirmed data to POST /logs to persist the record.
+
+Rate limited: max 10 requests per 60 seconds per client IP (P-COL-5).
 """
 from __future__ import annotations
 
@@ -13,32 +17,56 @@ import logging
 import os
 import subprocess
 import tempfile
-from datetime import date, datetime
+import time
+from collections import defaultdict
 from pathlib import Path
 
-from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
-from routes.safety_webhook import fire_safety_webhook
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 
-from db import get_pool
-from models import MappedFields, TranscribeAndLogResponse
+from models import (
+    ConfidenceScores,
+    ExtractedFields,
+    MappedFields,
+    TranscribeAndLogResponse,
+)
 from trigger_vocab import CANONICAL_TRIGGERS, normalize_trigger, is_known
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["transcribe-and-log"])
 
-# KNOWN_TRIGGERS now loaded from config/triggers.json via trigger_vocab module
-KNOWN_TRIGGERS = CANONICAL_TRIGGERS
+# ── Rate limiter (in-process sliding window, P-COL-5) ─────────────────────────
+_RATE_LIMIT_REQUESTS = 10   # max requests per window
+_RATE_LIMIT_WINDOW   = 60   # seconds
+_rate_timestamps: dict[str, list[float]] = defaultdict(list)
+
+
+async def _transcribe_rate_limit(request: Request) -> None:
+    """Dependency: enforce per-IP rate limit on /transcribe-and-log."""
+    client_ip = request.client.host if request.client else "unknown"
+    now        = time.monotonic()
+    cutoff     = now - _RATE_LIMIT_WINDOW
+
+    timestamps = _rate_timestamps[client_ip]
+    # Evict timestamps outside the current window
+    timestamps[:] = [t for t in timestamps if t > cutoff]
+
+    if len(timestamps) >= _RATE_LIMIT_REQUESTS:
+        retry_after = int(_RATE_LIMIT_WINDOW - (now - timestamps[0])) + 1
+        log.warning("Rate limit hit for IP %s (%d reqs in %ds)",
+                    client_ip, len(timestamps), _RATE_LIMIT_WINDOW)
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded: max {_RATE_LIMIT_REQUESTS} requests "
+                   f"per {_RATE_LIMIT_WINDOW}s. Retry after {retry_after}s.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    timestamps.append(now)
 
 KNOWN_TAGS = frozenset({
     "public_place", "sensory", "home", "school",
     "evening", "morning", "after-therapy",
-})
-
-RATING_KEYS = frozenset({
-    "sleep_quality", "mood", "sensory_sensitivity", "appetite",
-    "social_tolerance", "meltdown_count", "routine_adherence",
-    "communication_ease", "physical_activity", "caregiver_rating",
 })
 
 EXTRACTION_SYSTEM_PROMPT = """\
@@ -119,28 +147,22 @@ def _clamp_meltdown(v) -> int | None:
 
 
 def _validate_mapped(raw: dict) -> MappedFields:
-    """Sanitise and clamp LLM output into a MappedFields instance.
-
-    Unknown trigger / tag values are moved into notes rather than returned
-    in their respective arrays, per the contract in Section 3.
-    """
+    """Sanitise and clamp LLM output into a MappedFields instance."""
     # ── triggers ──────────────────────────────────────────────────────────────
     raw_triggers = raw.get("triggers") or []
     if not isinstance(raw_triggers, list):
         raw_triggers = []
-    # Normalize through shared vocabulary (resolve aliases, hyphen→underscore)
     normalized = [normalize_trigger(t) for t in raw_triggers]
     good_triggers = [t for t in normalized if is_known(t)]
     bad_triggers  = [t for t in normalized if not is_known(t)]
 
     # ── severity-trigger consistency: scan event/context for missed signals ──
-    severity = raw.get("severity")
     event_text = ((raw.get("event") or "") + " " + (raw.get("context") or "")).lower()
     _AGGRESSION_HINTS = {"暴力", "打架", "打人", "攻击", "攻擊", "咬人", "踢人",
                          "fight", "hit", "kick", "bite", "violen", "aggress"}
-    _SELF_HARM_HINTS = {"自伤", "自傷", "自残", "自殘", "撞头",
-                        "self harm", "self-harm", "self injury", "head bang"}
-    _ELOPEMENT_HINTS = {"走失", "跑掉", "bolting", "ran away", "running away", "elope"}
+    _SELF_HARM_HINTS  = {"自伤", "自傷", "自残", "自殘", "撞头",
+                         "self harm", "self-harm", "self injury", "head bang"}
+    _ELOPEMENT_HINTS  = {"走失", "跑掉", "bolting", "ran away", "running away", "elope"}
 
     if "aggression" not in good_triggers and any(h in event_text for h in _AGGRESSION_HINTS):
         good_triggers.append("aggression")
@@ -172,7 +194,6 @@ def _validate_mapped(raw: dict) -> MappedFields:
         extra = "; ".join(overflow)
         notes = f"{notes} [{extra}]" if notes else f"[{extra}]"
 
-    # Extract raw_signals from LLM output (preserves original language)
     raw_signals = raw.get("raw_signals") or []
     if not isinstance(raw_signals, list):
         raw_signals = []
@@ -202,136 +223,56 @@ def _validate_mapped(raw: dict) -> MappedFields:
     )
 
 
-def _compute_confidence(mapped: MappedFields) -> str:
-    """Deterministic heuristic: count non-null / non-empty mapped fields.
-    high ≥ 5, medium 2–4, low 0–1.
-    """
-    scalars = [
-        mapped.event, mapped.context, mapped.response, mapped.outcome,
-        mapped.severity, mapped.notes, mapped.checkin_notes,
-        mapped.sleep_quality, mapped.mood, mapped.sensory_sensitivity,
-        mapped.appetite, mapped.social_tolerance, mapped.meltdown_count,
-        mapped.routine_adherence, mapped.communication_ease,
-        mapped.physical_activity, mapped.caregiver_rating,
-    ]
-    count = sum(1 for v in scalars if v is not None)
-    count += 1 if mapped.triggers else 0
-    count += 1 if mapped.tags else 0
+def _compute_confidence(mapped: MappedFields) -> ConfidenceScores:
+    """Heuristic confidence scores based on extraction completeness."""
+    # trigger: high if trigger extracted with raw_signals, medium without, low if absent
+    if mapped.triggers and mapped.raw_signals:
+        trigger_conf = 0.9
+    elif mapped.triggers:
+        trigger_conf = 0.6
+    else:
+        trigger_conf = 0.1
 
-    if count >= 5:
-        return "high"
-    if count >= 2:
-        return "medium"
-    return "low"
+    # severity: high if explicitly stated, low if absent
+    sev_conf = 0.9 if mapped.severity is not None else 0.2
+
+    overall = round((trigger_conf + sev_conf) / 2, 2)
+    return ConfidenceScores(trigger=trigger_conf, severity=sev_conf, overall=overall)
 
 
-async def _save_to_db(
-    conn,
-    mapped: MappedFields,
-    child_id: str,
-    log_date: date,
-) -> tuple[object, object]:
-    """Conditionally INSERT into logs and UPSERT into daily_checks.
-    Returns (log_id, logged_at); either may be None if the respective
-    table was not written.
-    """
-    log_id = None
-    logged_at = None
+def _build_extracted(mapped: MappedFields) -> ExtractedFields:
+    """Map internal MappedFields to the API-facing ExtractedFields."""
+    return ExtractedFields(
+        trigger_type=mapped.triggers[0] if mapped.triggers else None,
+        severity=mapped.severity,
+        context=mapped.context,
+        outcome_hint=mapped.outcome,
+        tags=mapped.tags,
+    )
 
-    # ── event log ─────────────────────────────────────────────────────────────
-    event_present = any([
-        mapped.event,
-        mapped.triggers,
-        mapped.context,
-        mapped.response,
-        mapped.outcome,
-        mapped.severity is not None,
-        mapped.tags,
-        mapped.notes,
-    ])
 
-    if event_present:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO mzhu_test_logs
-                (child_id, event, triggers, raw_signals, context, response,
-                 outcome, severity, tags, notes, intervention_ids)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            RETURNING id, logged_at
-            """,
-            child_id,
-            mapped.event,
-            mapped.triggers,
-            mapped.raw_signals,
-            mapped.context,
-            mapped.response,
-            mapped.outcome,
-            mapped.severity,
-            mapped.tags,
-            mapped.notes,
-            [],
-        )
-        log_id    = row["id"]
-        logged_at = row["logged_at"]
-
-        # P3.1: Fire safety webhook on voice-logged events
-        # Pass both the raw transcription AND event text for intent detection
-        fire_safety_webhook(
-            child_id=child_id,
-            triggers=mapped.triggers or [],
-            severity=mapped.severity,
-            tags=mapped.tags or [],
-            logged_at=logged_at,
-            event_text=f"{transcription} {mapped.event or ''}",
-        )
-
-    # ── daily check-in ────────────────────────────────────────────────────────
-    ratings = {
-        k: getattr(mapped, k)
-        for k in (
-            "sleep_quality", "mood", "sensory_sensitivity", "appetite",
-            "social_tolerance", "meltdown_count", "routine_adherence",
-            "communication_ease", "physical_activity", "caregiver_rating",
-        )
-        if getattr(mapped, k) is not None
-    }
-
-    if ratings or mapped.checkin_notes:
-        await conn.execute(
-            """
-            INSERT INTO mzhu_test_daily_checks (check_date, ratings, notes)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (check_date) DO UPDATE SET
-                ratings    = mzhu_test_daily_checks.ratings || EXCLUDED.ratings,
-                notes      = COALESCE(EXCLUDED.notes, mzhu_test_daily_checks.notes),
-                updated_at = now()
-            """,
-            log_date,
-            ratings,
-            mapped.checkin_notes,
-        )
-
-    return log_id, logged_at
+def _build_warnings(mapped: MappedFields) -> list[str]:
+    warnings = []
+    if not mapped.triggers:
+        warnings.append("No trigger detected — please review and select manually")
+    if mapped.severity is None:
+        warnings.append("No severity detected — please set severity (1–5)")
+    return warnings
 
 
 # ── Endpoint ───────────────────────────────────────────────────────────────────
 
-@router.post("/transcribe-and-log", response_model=TranscribeAndLogResponse)
+@router.post("/transcribe-and-log", response_model=TranscribeAndLogResponse,
+             dependencies=[Depends(_transcribe_rate_limit)])
 async def transcribe_and_log(
     request: Request,
     audio: UploadFile = File(...),
-    child_id: str = Form("default"),
-    log_date: str | None = Form(None),
 ):
-    # ── parse log_date ────────────────────────────────────────────────────────
-    if log_date:
-        try:
-            parsed_date = date.fromisoformat(log_date)
-        except ValueError:
-            raise HTTPException(status_code=422, detail="log_date must be YYYY-MM-DD")
-    else:
-        parsed_date = date.today()
+    """Transcribe audio and extract behavioral fields for caregiver review.
 
+    Does NOT write to the database. After review, the UI POSTs confirmed
+    data to POST /logs to persist the record (P-UI-3 confirmation flow).
+    """
     # ── read audio ────────────────────────────────────────────────────────────
     data = await audio.read()
     if not data:
@@ -354,11 +295,13 @@ async def transcribe_and_log(
         )
         transcription = " ".join(s.text for s in segments).strip()
         log.info(
-            f"Transcribed {info.duration:.1f}s → "
-            f"'{transcription[:60]}{'…' if len(transcription) > 60 else ''}'"
+            "Transcribed %.1fs → '%s%s'",
+            info.duration,
+            transcription[:60],
+            "…" if len(transcription) > 60 else "",
         )
     except Exception as e:
-        log.error(f"Transcription error: {e}")
+        log.error("Transcription error: %s", e)
         raise HTTPException(status_code=500, detail=f"Transcription failed: {e}")
     finally:
         if tmp_path and os.path.exists(tmp_path):
@@ -368,68 +311,56 @@ async def transcribe_and_log(
         raise HTTPException(status_code=422, detail="No speech detected in audio")
 
     # ── LLM extraction via `claude -p` ────────────────────────────────────────
+    allowed_triggers = sorted(CANONICAL_TRIGGERS)
     full_prompt = f"{EXTRACTION_SYSTEM_PROMPT}\n\nCaregiver note:\n{transcription}"
+
     try:
         result = subprocess.run(
-            [
-                "claude", "-p",
-                "--tools", "",
-                "--system-prompt", "",
-                "--disable-slash-commands",
-                full_prompt,
-            ],
+            ["claude", "-p", "--disable-slash-commands", full_prompt],
             capture_output=True, text=True, timeout=60,
         )
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or "claude -p exited non-zero")
+
         raw_text = result.stdout.strip()
-        # Strip markdown code fences if Claude wraps the JSON.
-        # Handles both "```json\n{...}\n```" at the start AND cases where
-        # Claude adds preamble text before the fenced block.
+        # Strip markdown code fences if present
         if "```" in raw_text:
-            # Find the first opening fence
             fence_start = raw_text.index("```")
             after_fence = raw_text[fence_start + 3:]
-            # Skip the language tag line (e.g. "json\n")
             if "\n" in after_fence:
                 after_fence = after_fence[after_fence.index("\n") + 1:]
-            # Find the closing fence
             if "```" in after_fence:
                 after_fence = after_fence[:after_fence.rfind("```")].strip()
             raw_text = after_fence
-        # Handle case where Claude outputs text before/after bare JSON
         else:
             brace_start = raw_text.find("{")
-            brace_end = raw_text.rfind("}")
+            brace_end   = raw_text.rfind("}")
             if brace_start != -1 and brace_end != -1:
                 raw_text = raw_text[brace_start:brace_end + 1]
+
         raw_dict = json.loads(raw_text)
-    except json.JSONDecodeError as e:
-        log.error(f"LLM returned invalid JSON: {e}\nRaw: {raw_text!r}")
-        raise HTTPException(status_code=500, detail="Field extraction failed: LLM returned invalid JSON")
-    except Exception as e:
-        log.error(f"LLM extraction error: {e}")
-        raise HTTPException(status_code=500, detail=f"Field extraction failed: {e}")
 
-    # ── validate + clamp ──────────────────────────────────────────────────────
-    mapped     = _validate_mapped(raw_dict)
+    except (json.JSONDecodeError, RuntimeError, Exception) as e:
+        log.error("LLM extraction failed: %s", e)
+        # Return 200 with null extraction — caregiver can enter fields manually
+        return TranscribeAndLogResponse(
+            raw_text=transcription,
+            extracted=None,
+            confidence=ConfidenceScores(trigger=0.0, severity=0.0, overall=0.0),
+            allowed_trigger_values=allowed_triggers,
+            warnings=["Extraction failed — please enter fields manually"],
+        )
+
+    # ── validate + build response ─────────────────────────────────────────────
+    mapped   = _validate_mapped(raw_dict)
+    extracted = _build_extracted(mapped)
     confidence = _compute_confidence(mapped)
-
-    # ── save ──────────────────────────────────────────────────────────────────
-    pool = get_pool()
-    try:
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                log_id, logged_at = await _save_to_db(conn, mapped, child_id, parsed_date)
-    except Exception as e:
-        log.error(f"DB save error: {e}")
-        raise HTTPException(status_code=500, detail=f"Database save failed: {e}")
+    warnings   = _build_warnings(mapped)
 
     return TranscribeAndLogResponse(
-        log_id=log_id,
-        log_date=parsed_date,
-        logged_at=logged_at,
-        transcription=transcription,
-        mapping_confidence=confidence,
-        mapped=mapped,
+        raw_text=transcription,
+        extracted=extracted,
+        confidence=confidence,
+        allowed_trigger_values=allowed_triggers,
+        warnings=warnings,
     )

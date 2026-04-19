@@ -5,6 +5,7 @@ from datetime import date, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from trigger_vocab import normalize_trigger
 
 
 # ── Logs ──────────────────────────────────────────────────────────────────────
@@ -28,10 +29,10 @@ class LogCreate(BaseModel):
     def normalise_triggers(cls, v: list) -> list[str]:
         result = []
         for item in v:
-            item = str(item).strip().lower()
+            item = str(item).strip()
             if len(item) > 50:
                 raise ValueError(f"Trigger item exceeds 50 chars: '{item[:20]}…'")
-            result.append(item)
+            result.append(normalize_trigger(item))
         return result
 
     @field_validator("severity")
@@ -227,6 +228,8 @@ class DailyChecksResponse(BaseModel):
 # ── Transcribe-and-Log ─────────────────────────────────────────────────────────
 
 class MappedFields(BaseModel):
+    """Internal model — LLM extraction output used within transcribe_and_log.py.
+    Not returned directly in API responses; mapped to TranscribeAndLogResponse."""
     # Event log fields
     event: str | None = None
     triggers: list[str] = Field(default_factory=list)
@@ -251,10 +254,55 @@ class MappedFields(BaseModel):
     checkin_notes: str | None = None
 
 
+class ExtractedFields(BaseModel):
+    """LLM-extracted fields presented to caregiver for review/edit (P-UI-3)."""
+    trigger_type: str | None = None       # primary trigger (editable, dropdown)
+    severity: int | None = None           # 1–5 (editable)
+    context: str | None = None            # situation description (editable)
+    outcome_hint: str | None = None       # what happened after (editable)
+    tags: list[str] = Field(default_factory=list)  # location/context tags (editable)
+
+
+class ConfidenceScores(BaseModel):
+    """Heuristic confidence scores — display only, not editable."""
+    trigger: float    # 0.0–1.0
+    severity: float   # 0.0–1.0
+    overall: float    # 0.0–1.0
+
+
 class TranscribeAndLogResponse(BaseModel):
-    log_id: uuid.UUID | None
-    log_date: date
-    logged_at: datetime | None          # timestamp of the saved logs row; null if no event fields
-    transcription: str
-    mapping_confidence: Literal["high", "medium", "low"]
-    mapped: MappedFields
+    """POST /transcribe-and-log response (P-UI-3 canonical schema).
+
+    Returns extraction result only — NO DB write occurs.
+    UI must POST confirmed data to /logs separately after caregiver review.
+    """
+    raw_text: str                          # Whisper transcript — read-only in UI
+    extracted: ExtractedFields | None      # None if LLM extraction failed
+    confidence: ConfidenceScores
+    allowed_trigger_values: list[str]      # snapshot from triggers.json for dropdown
+    warnings: list[str] = Field(default_factory=list)
+
+
+# ── User Settings ──────────────────────────────────────────────────────────────
+
+class UserSettingsCreate(BaseModel):
+    """POST /collect/user-settings body — all fields optional except user_id + child_id."""
+    user_id: str
+    child_id: str
+    timezone: str | None = None
+    language: str | None = None
+    child_display_name: str | None = None
+    ui_preferences: dict[str, Any] | None = None
+
+
+class UserSettingsRead(BaseModel):
+    """GET / POST /collect/user-settings response."""
+    model_config = ConfigDict(from_attributes=True)
+
+    user_id: str
+    child_id: str
+    timezone: str | None
+    language: str | None
+    child_display_name: str | None
+    ui_preferences: dict[str, Any] | None
+    updated_at: datetime | None

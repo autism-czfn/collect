@@ -1,23 +1,24 @@
 from __future__ import annotations
 """
-Safety webhook (Collect P3.1).
+Safety webhook — P-COL-3.
 
-Fire-and-forget notification to the search service when a safety-critical
+Fires POST /api/safety-webhook to the search service when a safety-critical
 log is created. Runs in background — never blocks log creation.
 
-Uses intent-based safety detection (semantic regex patterns) instead of
-keyword matching, so "hurt himself", "end his life", "suicide" are all
-caught without needing exact trigger vocabulary entries.
+Canonical target: https://<search-host>:3001/api/safety-webhook
+Retry policy: 3 attempts with exponential backoff [1s, 2s, 4s].
+Failure logging: log.error per attempt, log.critical after exhaustion.
 
 Config:
-  SEARCH_WEBHOOK_URL env var (e.g. "https://localhost:18000/api/webhooks/trigger-event")
-  If not set, webhook is silently disabled.
+  SEARCH_WEBHOOK_URL env var — e.g. "https://localhost:3001/api/safety-webhook"
+  If not set, webhooks are disabled (warning logged at startup via main.py).
 """
 
 import asyncio
 import logging
 import os
 import re
+import uuid
 from datetime import datetime, timezone
 
 import httpx
@@ -26,8 +27,8 @@ log = logging.getLogger(__name__)
 
 SEARCH_WEBHOOK_URL = os.getenv("SEARCH_WEBHOOK_URL")
 
-# Timeout for webhook call — fire-and-forget, don't block
-WEBHOOK_TIMEOUT = 2.0
+WEBHOOK_TIMEOUT = 5.0          # seconds per attempt
+_RETRY_DELAYS   = [1, 2, 4]   # backoff between attempts (total ~7s max)
 
 
 # ── Intent-based safety detection ───────────────────────────────────────────
@@ -98,6 +99,17 @@ _SAFETY_MEDIUM_PATTERNS: dict[str, re.Pattern] = {
     ),
 }
 
+# Canonical trigger_type enum (matches SAFETY WEBHOOK CONTRACT in plan §3)
+_CONTRACT_ENUM = frozenset({
+    "self_harm", "violence", "abuse",
+    "elopement", "aggression", "emergency",
+})
+
+# Normalise keys that are detected but not in the CONTRACT enum as distinct values
+_TRIGGER_NORMALIZE: dict[str, str] = {
+    "suicide": "self_harm",   # suicide is self_harm clinically
+}
+
 
 def _detect_safety(text: str) -> tuple[str | None, str | None]:
     """Detect safety level from free text using semantic patterns.
@@ -114,46 +126,85 @@ def _detect_safety(text: str) -> tuple[str | None, str | None]:
     return None, None
 
 
-# ── Webhook logic ───────────────────────────────────────────────────────────
-
-def _determine_event_type(
+def _determine_webhook_trigger(
     text: str,
     triggers: list[str],
     severity: int | None,
-) -> tuple[str | None, str | None]:
-    """Determine webhook event_type using intent detection on the full text.
+) -> str | None:
+    """Return the trigger_type for the webhook payload, or None if no webhook needed.
 
-    Returns:
-        (event_type, safety_key) — e.g. ("safety_alert", "suicide") or (None, None)
+    Priority:
+      1. Intent-based detection on full text (catches semantic signals)
+      2. severity >= 4 with any known trigger (high-severity behavioural event)
+
+    Normalises "suicide" → "self_harm" per CONTRACT enum rules.
     """
-    # Intent-based detection on full event text (catches "suicide", "hurt himself", etc.)
     safety_level, safety_key = _detect_safety(text)
 
-    if safety_level == "HIGH":
-        return "safety_alert", safety_key
-    if safety_level == "MEDIUM":
-        return "safety_alert", safety_key
-    if severity is not None and severity >= 4:
-        return "high_severity", triggers[0] if triggers else "unknown"
-    return None, None
+    if safety_key:
+        trigger_type = _TRIGGER_NORMALIZE.get(safety_key, safety_key)
+        # Only fire if trigger_type is in the CONTRACT enum; skip non-contract
+        # signals like "medication_concern" which the search service doesn't handle.
+        return trigger_type if trigger_type in _CONTRACT_ENUM else None
 
+    if severity is not None and severity >= 4 and triggers:
+        candidate = triggers[0]
+        trigger_type = _TRIGGER_NORMALIZE.get(candidate, candidate)
+        return trigger_type if trigger_type in _CONTRACT_ENUM else None
+
+    return None
+
+
+# ── Webhook send with retry ──────────────────────────────────────────────────
 
 async def _send_webhook(payload: dict) -> None:
-    """Send webhook payload. Logs on failure, never raises."""
-    try:
-        async with httpx.AsyncClient(verify=False, timeout=WEBHOOK_TIMEOUT) as client:
-            resp = await client.post(SEARCH_WEBHOOK_URL, json=payload)
-            log.info(
-                "Webhook sent: event=%s trigger=%s status=%d",
-                payload.get("event_type"),
-                payload.get("trigger"),
-                resp.status_code,
-            )
-    except httpx.TimeoutException:
-        log.warning("Webhook timeout (%.1fs) for event=%s", WEBHOOK_TIMEOUT, payload.get("event_type"))
-    except Exception as e:
-        log.warning("Webhook failed: %s (event=%s)", e, payload.get("event_type"))
+    """Send webhook with 3× retry + exponential backoff. Never raises.
 
+    Logs:
+      - log.error  on each failed attempt (status, full payload)
+      - log.critical after all 3 retries exhausted
+    """
+    for attempt in range(1, 4):
+        try:
+            async with httpx.AsyncClient(verify=False, timeout=WEBHOOK_TIMEOUT) as client:
+                resp = await client.post(SEARCH_WEBHOOK_URL, json=payload)
+            if 200 <= resp.status_code < 300:
+                log.info(
+                    "Webhook sent: trigger=%s child=%s status=%d",
+                    payload.get("trigger_type"),
+                    payload.get("child_id"),
+                    resp.status_code,
+                )
+                return
+            log.error(
+                "Webhook attempt %d/3 failed: status=%d trigger=%s child=%s payload=%s",
+                attempt, resp.status_code,
+                payload.get("trigger_type"), payload.get("child_id"), payload,
+            )
+        except httpx.TimeoutException:
+            log.error(
+                "Webhook attempt %d/3 timed out (%.1fs): trigger=%s child=%s",
+                attempt, WEBHOOK_TIMEOUT,
+                payload.get("trigger_type"), payload.get("child_id"),
+            )
+        except Exception as e:
+            log.error(
+                "Webhook attempt %d/3 error: %s — trigger=%s child=%s payload=%s",
+                attempt, e,
+                payload.get("trigger_type"), payload.get("child_id"), payload,
+            )
+
+        if attempt < 3:
+            await asyncio.sleep(_RETRY_DELAYS[attempt - 1])
+
+    log.critical(
+        "Webhook EXHAUSTED after 3 attempts — safety signal may be lost. "
+        "trigger=%s child=%s payload=%s",
+        payload.get("trigger_type"), payload.get("child_id"), payload,
+    )
+
+
+# ── Public API ───────────────────────────────────────────────────────────────
 
 def fire_safety_webhook(
     child_id: str,
@@ -167,37 +218,43 @@ def fire_safety_webhook(
 
     Called from create_log after DB write. Never blocks, never raises.
 
+    Payload conforms to SAFETY WEBHOOK CONTRACT (plan §3):
+      event_id, child_id, trigger_type, severity, raw_text,
+      normalized_intent, timestamp, source: "collect"
+
     Args:
-        child_id: child identifier
-        triggers: normalized trigger list from the log
-        severity: severity rating (1-5 or None)
-        tags: log tags
-        logged_at: when the log was created
-        event_text: raw event description — used for intent-based safety detection
+        child_id:   child identifier
+        triggers:   normalized trigger list from the log
+        severity:   severity rating (1–5 or None)
+        tags:       log tags (unused in payload, kept for call-site compat)
+        logged_at:  when the log was created
+        event_text: raw caregiver text — used for intent detection + raw_text field
     """
     if not SEARCH_WEBHOOK_URL:
         return
 
-    # Build full text for intent detection: event + triggers + notes
     full_text = " ".join([event_text] + triggers)
-
-    event_type, safety_key = _determine_event_type(full_text, triggers, severity)
-    if event_type is None:
+    trigger_type = _determine_webhook_trigger(full_text, triggers, severity)
+    if trigger_type is None:
         return
 
     payload = {
-        "event_type": event_type,
-        "child_id": child_id,
-        "trigger": safety_key or (triggers[0] if triggers else "unknown"),
-        "severity": severity,
-        "tags": tags,
-        "logged_at": (logged_at or datetime.now(timezone.utc)).isoformat(),
+        "event_id":          str(uuid.uuid4()),
+        "child_id":          child_id,
+        "trigger_type":      trigger_type,
+        "severity":          severity,
+        "raw_text":          event_text,
+        "normalized_intent": trigger_type,
+        "timestamp":         (logged_at or datetime.now(timezone.utc)).isoformat(),
+        "source":            "collect",
     }
 
-    # Fire and forget — don't await, don't block log creation
     try:
         loop = asyncio.get_event_loop()
         loop.create_task(_send_webhook(payload))
-        log.info("Webhook scheduled: event=%s trigger=%s", event_type, safety_key)
+        log.info(
+            "Webhook scheduled: trigger=%s child=%s severity=%s",
+            trigger_type, child_id, severity,
+        )
     except RuntimeError:
-        log.warning("No event loop — skipping webhook")
+        log.warning("No event loop — webhook could not be scheduled for trigger=%s", trigger_type)
