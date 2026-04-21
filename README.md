@@ -10,6 +10,7 @@ A FastAPI service that ingests caregiver observations about a child's day, trans
 - **Trigger signals.** Aggregated trigger data over a rolling window for the search repo to consume — frequency counts, severity averages, time-of-day distributions, and common contexts/environments.
 - **Safety webhook.** Fire-and-forget notification to the search service when a safety-critical log is created (severity ≥ 4, self-harm/suicide/elopement/violence intent detected via regex). Configurable via `SEARCH_WEBHOOK_URL`; failures never block log creation.
 - **Multilingual input.** Caregivers can speak in any language; the LLM extracts all structured fields in English. Original-language phrases are preserved in `raw_signals` for auditability.
+- **Conversational chat.** A streaming chat tab backed by a two-stage pipeline: a planner LLM call classifies intent (`BEHAVIOR_PATTERN`, `INTERVENTION`, `MEDICAL`, `SAFETY`) and rewrites the query, then a parallel retrieval stage pulls relevant behaviour logs, crawled clinical evidence, and live search results before sending a streamed Claude answer over SSE. Conversation history is persisted per `child_id` in `mzhu_test_chat_messages` with automatic summarisation for long sessions.
 - **Daily check-ins.** One row per day holding sparse 1–5 ratings (sleep, mood, sensory sensitivity, appetite, social tolerance, routine adherence, communication ease, physical activity, caregiver rating) plus a non-negative `meltdown_count` and notes. Repeat posts for the same date merge via JSONB concatenation.
 - **Interventions.** Suggestions move through `open → adopted → closed` with outcome notes; soft-delete supported.
 - **Weekly summaries.** Upsert-by-Monday `week_start` with free-form text and a stats JSONB blob; `GET /summaries/latest` returns the most recent.
@@ -38,14 +39,18 @@ A FastAPI service that ingests caregiver observations about a child's day, trans
 | GET    | `/daily-checks/{date}`        | Fetch one day                            |
 | POST   | `/summaries`                  | Upsert weekly summary (Monday `week_start`) |
 | GET    | `/summaries/latest`           | Most recent weekly summary               |
+| POST   | `/api/chat/stream`            | SSE chat pipeline: planner → retrieval → Claude stream |
+| GET    | `/api/chat/history`           | Load prior conversation turns for a `child_id` |
 
 ## Project layout
 
 ```
 main.py                    FastAPI app, lifespan, /health, /transcribe
-db.py                      asyncpg pool with JSONB codec
+db.py                      asyncpg pool with JSONB codec (+ optional crawl pool)
 models.py                  Pydantic request/response models + validators
 trigger_vocab.py           Shared trigger vocabulary loader + normalizer
+chat_planner.py            Intent classification + query rewrite (single LLM call)
+chat_retrieval.py          Two-stage retrieval: logs, crawled evidence, live search
 config/
   triggers.json            Canonical triggers + alias mappings
 routes/
@@ -57,6 +62,7 @@ routes/
   triggers.py              /triggers/vocabulary endpoint
   trigger_signals.py       /logs/trigger-signals endpoint
   safety_webhook.py        Fire-and-forget safety webhook to search service
+  chat.py                  /api/chat/stream (SSE) + /api/chat/history
 migrations/
   001_create_tables.sql    logs, interventions, summaries
   002_create_daily_checks.sql
@@ -64,11 +70,12 @@ migrations/
   004_clinician_cache.sql
   005_insights_cache.sql
   006_trigger_normalization.sql
+  008_chat_messages.sql    chat_messages table + child_id/time index
 setup.sh                   environment / dependency bootstrap
 requirements.txt           Python dependencies
 ```
 
-All tables are prefixed `mzhu_test_` (logs, interventions, summaries, daily_checks, unknown_triggers).
+All tables are prefixed `mzhu_test_` (logs, interventions, summaries, daily_checks, unknown_triggers, chat_messages).
 
 ## Configuration
 
@@ -82,6 +89,8 @@ Reads `.env` from the project root:
 | `WHISPER_LANGUAGE`   | auto      | Force transcription language               |
 | `USER_DATABASE_URL`  | required  | asyncpg DSN; server exits if unset         |
 | `SEARCH_WEBHOOK_URL` | *(none)*  | Safety webhook target (e.g. search service); disabled if unset |
+| `SEARCH_SERVICE_URL` | *(none)*  | Live search service base URL used by chat retrieval; disabled if unset |
+| `CRAWL_DATABASE_URL` | *(none)*  | asyncpg DSN for the crawled-evidence database; chat falls back to tsvector search or skips if unset |
 
 TLS certs are expected at `../certs/cert.pem` and `../certs/key.pem` relative to this directory.
 
@@ -97,4 +106,4 @@ The `/transcribe-and-log` endpoint shells out to `claude -p` for field extractio
 
 ## Dependencies
 
-`fastapi`, `uvicorn[standard]`, `python-multipart`, `python-dotenv`, `asyncpg`, `pydantic`, `faster-whisper`, `anthropic`, `httpx`.
+`fastapi`, `uvicorn[standard]`, `python-multipart`, `python-dotenv`, `asyncpg`, `pydantic`, `faster-whisper`, `anthropic`, `httpx`, `fastembed`.
