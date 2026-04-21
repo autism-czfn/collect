@@ -42,11 +42,13 @@ from faster_whisper import WhisperModel
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await _db.create_pool()
+    await _db.create_crawl_pool()          # optional — logs warning if not configured
     log.info(f"Loading faster-whisper model '{WHISPER_MODEL}' …")
     app.state.whisper_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
     log.info("Model ready.")
     yield
     await _db.close_pool()
+    await _db.close_crawl_pool()
 
 
 # ── FastAPI app ────────────────────────────────────────────────────────────────
@@ -71,6 +73,7 @@ from routes.daily_checks import router as daily_checks_router
 from routes.transcribe_and_log import router as tal_router
 from routes.triggers import router as triggers_router
 from routes.trigger_signals import router as trigger_signals_router
+from routes.chat import router as chat_router
 
 # trigger_signals_router MUST be registered before logs_router:
 # /logs/trigger-signals (static) must match before /logs/{log_id} (parameterized),
@@ -82,6 +85,7 @@ app.include_router(summaries_router)
 app.include_router(daily_checks_router)
 app.include_router(tal_router)
 app.include_router(triggers_router)
+app.include_router(chat_router)
 
 # ── Existing endpoints (unchanged) ─────────────────────────────────────────────
 

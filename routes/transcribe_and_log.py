@@ -230,6 +230,7 @@ async def _save_to_db(
     mapped: MappedFields,
     child_id: str,
     log_date: date,
+    transcription: str = "",
 ) -> tuple[object, object]:
     """Conditionally INSERT into logs and UPSERT into daily_checks.
     Returns (log_id, logged_at); either may be None if the respective
@@ -420,7 +421,7 @@ async def transcribe_and_log(
     try:
         async with pool.acquire() as conn:
             async with conn.transaction():
-                log_id, logged_at = await _save_to_db(conn, mapped, child_id, parsed_date)
+                log_id, logged_at = await _save_to_db(conn, mapped, child_id, parsed_date, transcription)
     except Exception as e:
         log.error(f"DB save error: {e}")
         raise HTTPException(status_code=500, detail=f"Database save failed: {e}")
@@ -429,7 +430,7 @@ async def transcribe_and_log(
         log_id=log_id,
         log_date=parsed_date,
         logged_at=logged_at,
-        transcription=transcription,
+        raw_text=transcription,
         mapping_confidence=confidence,
         mapped=mapped,
     )

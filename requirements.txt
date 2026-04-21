@@ -6,3 +6,5 @@ python-dotenv
 asyncpg
 pydantic
 anthropic
+fastembed
+httpx

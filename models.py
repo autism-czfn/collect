@@ -138,15 +138,6 @@ class SummaryCreate(BaseModel):
     summary_text: str
     stats_json: dict[str, Any]
 
-    @field_validator("week_start")
-    @classmethod
-    def must_be_monday(cls, v: date) -> date:
-        if v.weekday() != 0:
-            raise ValueError(
-                f"week_start must be a Monday; {v} is a {v.strftime('%A')}"
-            )
-        return v
-
 
 class SummaryRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -255,6 +246,6 @@ class TranscribeAndLogResponse(BaseModel):
     log_id: uuid.UUID | None
     log_date: date
     logged_at: datetime | None          # timestamp of the saved logs row; null if no event fields
-    transcription: str
+    raw_text: str
     mapping_confidence: Literal["high", "medium", "low"]
     mapped: MappedFields

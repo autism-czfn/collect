@@ -9,6 +9,8 @@ import asyncpg
 
 log = logging.getLogger(__name__)
 
+# ── User DB pool (USER_DATABASE_URL) ──────────────────────────────────────────
+
 _pool: Optional[asyncpg.Pool] = None
 
 
@@ -50,3 +52,38 @@ async def close_pool() -> None:
 def get_pool() -> asyncpg.Pool:
     assert _pool is not None, "DB pool not initialised"
     return _pool
+
+
+# ── Crawl DB pool (CRAWL_DATABASE_URL) ────────────────────────────────────────
+# Optional — if not configured, crawl retrieval is silently disabled (Phase 2).
+
+_crawl_pool: Optional[asyncpg.Pool] = None
+
+
+async def create_crawl_pool() -> None:
+    global _crawl_pool
+    dsn = os.getenv("CRAWL_DATABASE_URL")
+    if not dsn:
+        log.warning(
+            "CRAWL_DATABASE_URL not set — crawl DB retrieval disabled (Phase 2 feature)"
+        )
+        return
+    _crawl_pool = await asyncpg.create_pool(
+        dsn,
+        min_size=1,
+        max_size=5,
+        command_timeout=30,
+    )
+    log.info("Crawl DB pool ready (min=1 max=5 timeout=30s)")
+
+
+async def close_crawl_pool() -> None:
+    global _crawl_pool
+    if _crawl_pool:
+        await _crawl_pool.close()
+        _crawl_pool = None
+
+
+def get_crawl_pool() -> Optional[asyncpg.Pool]:
+    """Returns None if CRAWL_DATABASE_URL is not configured. Callers must handle None."""
+    return _crawl_pool

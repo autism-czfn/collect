@@ -109,14 +109,12 @@ configure_env() {
     echo "  Configure environment (.env)"
     echo "  ─────────────────────────────────"
 
-    # Read existing values as defaults
+    # ── User DB ───────────────────────────────────────────────────────────────
     local cur_url
     cur_url=$(grep -E '^USER_DATABASE_URL=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)
 
-    # Parse existing DSN if present
     local def_host="localhost" def_port="5432" def_db="mzhu_test_autism_users" def_user="dbuser" def_pass=""
     if [ -n "$cur_url" ]; then
-        # postgresql://user:pass@host:port/db
         def_user=$(echo "$cur_url" | sed -E 's|postgresql://([^:@]+).*|\1|')
         def_pass=$(echo "$cur_url" | sed -E 's|postgresql://[^:]+:([^@]*)@.*|\1|')
         def_host=$(echo "$cur_url" | sed -E 's|.*@([^:/]+)[:/].*|\1|')
@@ -124,29 +122,64 @@ configure_env() {
         def_db=$(echo "$cur_url"   | sed -E 's|.*/([^/]+)$|\1|')
     fi
 
-    local cur_port cur_model cur_lang
-    cur_port=$(grep -E '^PORT='            "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)
-    cur_model=$(grep -E '^WHISPER_MODEL='  "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)
-    cur_lang=$(grep  -E '^WHISPER_LANGUAGE=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)
-
-    local def_api_port="${cur_port:-18001}"
-    local def_model="${cur_model:-base}"
-    local def_lang="${cur_lang:-}"
-
+    echo "  ── User DB (USER_DATABASE_URL) ──"
     printf "  DB host     [%s]: " "$def_host";  read -r inp; DB_HOST="${inp:-$def_host}"
     printf "  DB port     [%s]: " "$def_port";  read -r inp; DB_PORT="${inp:-$def_port}"
     printf "  DB name     [%s]: " "$def_db";    read -r inp; DB_NAME="${inp:-$def_db}"
     printf "  DB user     [%s]: " "$def_user";  read -r inp; DB_USER="${inp:-$def_user}"
     printf "  DB password [%s]: " "${def_pass:+(set)}"; read -rs inp; echo
     DB_PASS="${inp:-$def_pass}"
-    printf "  API port    [%s]: " "$def_api_port"; read -r inp; API_PORT="${inp:-$def_api_port}"
-    printf "  Whisper model [%s]: " "$def_model"; read -r inp; W_MODEL="${inp:-$def_model}"
-    printf "  Whisper language (blank=auto) [%s]: " "$def_lang"; read -r inp; W_LANG="${inp:-$def_lang}"
 
     local dsn="postgresql://${DB_USER}:${DB_PASS}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
 
+    # ── Crawler DB (CRAWL_DATABASE_URL) ───────────────────────────────────────
+    local cur_crawl_url
+    cur_crawl_url=$(grep -E '^CRAWL_DATABASE_URL=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)
+
+    local cdef_host="localhost" cdef_port="5432" cdef_db="autism_crawler" cdef_user="dbuser" cdef_pass=""
+    if [ -n "$cur_crawl_url" ]; then
+        cdef_user=$(echo "$cur_crawl_url" | sed -E 's|postgresql://([^:@]+).*|\1|')
+        cdef_pass=$(echo "$cur_crawl_url" | sed -E 's|postgresql://[^:]+:([^@]*)@.*|\1|')
+        cdef_host=$(echo "$cur_crawl_url" | sed -E 's|.*@([^:/]+)[:/].*|\1|')
+        cdef_port=$(echo "$cur_crawl_url" | sed -E 's|.*:([0-9]+)/.*|\1|')
+        cdef_db=$(echo "$cur_crawl_url"   | sed -E 's|.*/([^/]+)$|\1|')
+    fi
+
+    echo ""
+    echo "  ── Crawler DB (CRAWL_DATABASE_URL) — leave blank to skip ──"
+    printf "  Crawl DB host     [%s]: " "$cdef_host";  read -r inp; CRAWL_HOST="${inp:-$cdef_host}"
+    printf "  Crawl DB port     [%s]: " "$cdef_port";  read -r inp; CRAWL_PORT="${inp:-$cdef_port}"
+    printf "  Crawl DB name     [%s]: " "$cdef_db";    read -r inp; CRAWL_DB="${inp:-$cdef_db}"
+    printf "  Crawl DB user     [%s]: " "$cdef_user";  read -r inp; CRAWL_USER="${inp:-$cdef_user}"
+    printf "  Crawl DB password [%s]: " "${cdef_pass:+(set)}"; read -rs inp; echo
+    CRAWL_PASS="${inp:-$cdef_pass}"
+
+    local crawl_dsn="postgresql://${CRAWL_USER}:${CRAWL_PASS}@${CRAWL_HOST}:${CRAWL_PORT}/${CRAWL_DB}"
+
+    # ── Service settings ──────────────────────────────────────────────────────
+    local cur_port cur_model cur_lang cur_search_url
+    cur_port=$(grep -E '^PORT='               "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)
+    cur_model=$(grep -E '^WHISPER_MODEL='     "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)
+    cur_lang=$(grep  -E '^WHISPER_LANGUAGE='  "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)
+    cur_search_url=$(grep -E '^SEARCH_SERVICE_URL=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)
+
+    local def_api_port="${cur_port:-18001}"
+    local def_model="${cur_model:-base}"
+    local def_lang="${cur_lang:-}"
+    local def_search_url="${cur_search_url:-http://localhost:3001}"
+
+    echo ""
+    echo "  ── Service settings ──"
+    printf "  API port    [%s]: " "$def_api_port"; read -r inp; API_PORT="${inp:-$def_api_port}"
+    printf "  Whisper model [%s]: " "$def_model"; read -r inp; W_MODEL="${inp:-$def_model}"
+    printf "  Whisper language (blank=auto) [%s]: " "$def_lang"; read -r inp; W_LANG="${inp:-$def_lang}"
+    printf "  Search service URL [%s]: " "$def_search_url"; read -r inp; SEARCH_URL="${inp:-$def_search_url}"
+
+    # ── Write .env ────────────────────────────────────────────────────────────
     {
         echo "USER_DATABASE_URL=${dsn}"
+        echo "CRAWL_DATABASE_URL=${crawl_dsn}"
+        echo "SEARCH_SERVICE_URL=${SEARCH_URL}"
         echo "PORT=${API_PORT}"
         echo "WHISPER_MODEL=${W_MODEL}"
         [ -n "$W_LANG" ] && echo "WHISPER_LANGUAGE=${W_LANG}"
@@ -154,7 +187,9 @@ configure_env() {
 
     echo ""
     echo "  ✅  .env written"
-    echo "  🔗  DSN: ${dsn}"
+    echo "  🔗  User DSN:  ${dsn}"
+    echo "  🔗  Crawl DSN: ${crawl_dsn}"
+    echo "  🔍  Search:    ${SEARCH_URL}"
     echo ""
 }
 
