@@ -1,26 +1,32 @@
 """
 POST /transcribe-and-log
 
-Accepts an audio blob, transcribes it with Whisper, extracts structured
-fields via LLM, conditionally saves to mzhu_test_logs and/or
-mzhu_test_daily_checks, and returns the saved entry details plus
-pre-fill data for the UI.
+Accepts an audio blob, transcribes it with Whisper, then either:
+  mode="structured" (default): extracts structured fields via LLM, saves to
+      mzhu_test_logs and/or mzhu_test_daily_checks.
+  mode="raw": stores verbatim sentences in mzhu_test_voice_notes with
+      rule-based category tagging; no LLM extraction.
+
+Returns TranscribeAndLogResponse (structured) or VoiceNoteRead (raw).
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 from datetime import date, datetime
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from routes.safety_webhook import fire_safety_webhook
 
 from db import get_pool
-from models import MappedFields, TranscribeAndLogResponse
+from models import MappedFields, TranscribeAndLogResponse, VoiceNoteRead
+from time_utils import time_label_from_hour
 from trigger_vocab import CANONICAL_TRIGGERS, normalize_trigger, is_known
 
 log = logging.getLogger(__name__)
@@ -29,6 +35,54 @@ router = APIRouter(tags=["transcribe-and-log"])
 
 # KNOWN_TRIGGERS now loaded from config/triggers.json via trigger_vocab module
 KNOWN_TRIGGERS = CANONICAL_TRIGGERS
+
+# ── Raw-mode: rule-based sentence categorisation ──────────────────────────────
+
+_CATEGORY_KEYWORDS: dict[str, list[str]] = {
+    "mood": [
+        "happy", "sad", "anxious", "calm", "frustrated", "excited", "angry",
+        "content", "joyful", "upset", "worried", "stress", "cheerful", "grumpy",
+        "irritable", "euphoric", "depressed",
+    ],
+    "meltdown": [
+        "meltdown", "tantrum", "breakdown", "hit", "scream", "threw", "throwing",
+        "kick", "bite", "biting", "aggress", "rage", "explosion", "outburst",
+    ],
+    "social": [
+        "friend", "cousin", "sibling", "classmate", "played with", "talked to",
+        "peer", "teacher", "therapist", "connect", "interact", "together",
+        "share", "turn-taking",
+    ],
+    "sensory": [
+        "loud", "bright", "texture", "smell", "refused to eat", "covered ears",
+        "sensitiv", "overwhelm", "noise", "light", "touch", "scratch",
+        "itchy", "temperature", "taste", "wet",
+    ],
+    "routine": [
+        "schedule", "transition", "refused", "surprise", "change", "unexpected",
+        "routine", "structure", "out of order", "different", "deviation",
+    ],
+    "sleep": [
+        "sleep", "nap", "woke up", "nightmare", "tired", "bedtime",
+        "insomnia", "drowsy", "restless", "didn't sleep",
+    ],
+}
+
+
+def _categorize_text(text: str) -> list[str]:
+    """Return sorted category tags found in text (note-level union)."""
+    lower = text.lower()
+    found = [
+        cat for cat, kws in _CATEGORY_KEYWORDS.items()
+        if any(kw in lower for kw in kws)
+    ]
+    return sorted(found) if found else ["other"]
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split transcript on sentence-ending punctuation."""
+    parts = re.split(r"(?<=[.!?。！？])\s+", text)
+    return [p.strip() for p in parts if p.strip()]
 
 KNOWN_TAGS = frozenset({
     "public_place", "sensory", "home", "school",
@@ -317,13 +371,31 @@ async def _save_to_db(
 
 # ── Endpoint ───────────────────────────────────────────────────────────────────
 
-@router.post("/transcribe-and-log", response_model=TranscribeAndLogResponse)
+@router.post("/transcribe-and-log")
 async def transcribe_and_log(
     request: Request,
     audio: UploadFile = File(...),
     child_id: str = Form("default"),
     log_date: str | None = Form(None),
+    mode: str = Form("structured"),
+    client_local_hour: int | None = Form(None),
 ):
+    """
+    mode="structured" (default): LLM extraction → mzhu_test_logs / mzhu_test_daily_checks.
+      Returns TranscribeAndLogResponse.
+
+    mode="raw": verbatim sentences → mzhu_test_voice_notes.
+      Returns VoiceNoteRead. No LLM call.
+
+    client_local_hour: integer 0-23 from new Date().getHours().
+      Used for local_time_label in raw mode. Ignored in structured mode.
+    """
+    if mode not in ("structured", "raw"):
+        raise HTTPException(status_code=422, detail="mode must be 'structured' or 'raw'")
+
+    if client_local_hour is not None and not (0 <= client_local_hour <= 23):
+        raise HTTPException(status_code=422, detail="client_local_hour must be 0–23")
+
     # ── parse log_date ────────────────────────────────────────────────────────
     if log_date:
         try:
@@ -355,7 +427,7 @@ async def transcribe_and_log(
         )
         transcription = " ".join(s.text for s in segments).strip()
         log.info(
-            f"Transcribed {info.duration:.1f}s → "
+            f"[{mode}] Transcribed {info.duration:.1f}s → "
             f"'{transcription[:60]}{'…' if len(transcription) > 60 else ''}'"
         )
     except Exception as e:
@@ -367,6 +439,12 @@ async def transcribe_and_log(
 
     if not transcription:
         raise HTTPException(status_code=422, detail="No speech detected in audio")
+
+    # ── raw mode: store verbatim sentences, skip LLM ─────────────────────────
+    if mode == "raw":
+        return await _handle_raw_mode(
+            transcription, child_id, parsed_date, client_local_hour
+        )
 
     # ── LLM extraction via `claude -p` ────────────────────────────────────────
     full_prompt = f"{EXTRACTION_SYSTEM_PROMPT}\n\nCaregiver note:\n{transcription}"
@@ -422,6 +500,31 @@ async def transcribe_and_log(
         async with pool.acquire() as conn:
             async with conn.transaction():
                 log_id, logged_at = await _save_to_db(conn, mapped, child_id, parsed_date, transcription)
+
+                # Option A: also archive the raw transcript in voice_notes so the
+                # original words are never lost, even when structured extraction ran.
+                sentences        = _split_sentences(transcription)
+                categories       = _categorize_text(transcription)
+                local_time_label = time_label_from_hour(client_local_hour) if client_local_hour is not None else None
+                vn_row = await conn.fetchrow(
+                    """
+                    INSERT INTO mzhu_test_voice_notes
+                        (child_id, client_local_hour, local_time_label,
+                         raw_text, sentences, preliminary_category)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    RETURNING id
+                    """,
+                    child_id,
+                    client_local_hour,
+                    local_time_label,
+                    transcription,
+                    sentences,
+                    categories,
+                )
+                log.info(
+                    f"voice_note archived (structured): id={vn_row['id']} child={child_id} "
+                    f"sentences={len(sentences)} categories={categories}"
+                )
     except Exception as e:
         log.error(f"DB save error: {e}")
         raise HTTPException(status_code=500, detail=f"Database save failed: {e}")
@@ -434,3 +537,58 @@ async def transcribe_and_log(
         mapping_confidence=confidence,
         mapped=mapped,
     )
+
+
+# ── Raw mode handler ───────────────────────────────────────────────────────────
+
+async def _handle_raw_mode(
+    transcription: str,
+    child_id: str,
+    log_date: date,
+    client_local_hour: int | None,
+) -> VoiceNoteRead:
+    """
+    Store verbatim voice note sentences without LLM extraction.
+
+    1. Split transcription into sentences.
+    2. Apply rule-based category tagging at note level (union across all sentences).
+    3. Compute local_time_label from client_local_hour.
+    4. INSERT into mzhu_test_voice_notes.
+    5. Return VoiceNoteRead.
+    """
+    sentences = _split_sentences(transcription)
+    categories = _categorize_text(transcription)
+    local_time_label = time_label_from_hour(client_local_hour) if client_local_hour is not None else None
+
+    pool = get_pool()
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO mzhu_test_voice_notes
+                    (child_id, client_local_hour, local_time_label,
+                     raw_text, sentences, preliminary_category)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING *
+                """,
+                child_id,
+                client_local_hour,
+                local_time_label,
+                transcription,
+                sentences,
+                categories,
+            )
+    except Exception as e:
+        log.error(f"DB save error (voice_note raw): {e}")
+        raise HTTPException(status_code=500, detail=f"Database save failed: {e}")
+
+    log.info(
+        f"voice_note saved: id={row['id']} child={child_id} "
+        f"label={local_time_label} sentences={len(sentences)} "
+        f"categories={categories}"
+    )
+    d = dict(row)
+    for field in ("sentences", "preliminary_category"):
+        if d.get(field) is None:
+            d[field] = []
+    return VoiceNoteRead.model_validate(d)

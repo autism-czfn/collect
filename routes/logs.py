@@ -161,6 +161,7 @@ async def create_log(body: LogCreate):
 async def list_logs(
     days: Annotated[int, Query(ge=1)] = 30,
     limit: Annotated[int, Query(ge=1, le=1000)] = 200,
+    offset: Annotated[int, Query(ge=0)] = 0,
     include_voided: bool = False,
 ):
     pool = get_pool()
@@ -173,10 +174,12 @@ async def list_logs(
               AND (NOT voided OR $2)
             ORDER BY logged_at DESC
             LIMIT $3
+            OFFSET $4
             """,
             days,
             include_voided,
             limit,
+            offset,
         )
     total = rows[0]["_total"] if rows else 0
     return LogsResponse(logs=[_row_to_log(r) for r in rows], total=total)

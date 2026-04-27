@@ -74,6 +74,9 @@ from routes.transcribe_and_log import router as tal_router
 from routes.triggers import router as triggers_router
 from routes.trigger_signals import router as trigger_signals_router
 from routes.chat import router as chat_router
+from routes.food_log import router as food_log_router
+from routes.voice_notes import router as voice_notes_router
+from routes.abstractions import router as abstractions_router
 
 # trigger_signals_router MUST be registered before logs_router:
 # /logs/trigger-signals (static) must match before /logs/{log_id} (parameterized),
@@ -86,6 +89,9 @@ app.include_router(daily_checks_router)
 app.include_router(tal_router)
 app.include_router(triggers_router)
 app.include_router(chat_router)
+app.include_router(food_log_router)
+app.include_router(voice_notes_router)
+app.include_router(abstractions_router)
 
 # ── Existing endpoints (unchanged) ─────────────────────────────────────────────
 

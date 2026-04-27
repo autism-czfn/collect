@@ -249,3 +249,100 @@ class TranscribeAndLogResponse(BaseModel):
     raw_text: str
     mapping_confidence: Literal["high", "medium", "low"]
     mapped: MappedFields
+
+
+# ── Food Logs ──────────────────────────────────────────────────────────────────
+
+class FoodLogRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    child_id: str
+    logged_at: datetime
+    client_local_hour: int | None
+    meal_type: str | None
+    photo_mime: str
+    foods_identified: list[str] = Field(default_factory=list)
+    estimated_calories: int | None
+    macros: dict[str, Any] = Field(default_factory=dict)
+    sensory_notes: str | None
+    concerns: str | None
+    confidence: str | None
+    user_notes: str | None
+    voided: bool
+    voided_at: datetime | None
+    # photo_data intentionally excluded — retrieve via GET /food-log/{id}/photo
+
+
+class FoodLogPatch(BaseModel):
+    """All fields optional — COALESCE semantics on write."""
+    foods_identified: list[str] | None = None
+    meal_type: str | None = None
+    user_notes: str | None = None
+
+    @field_validator("meal_type")
+    @classmethod
+    def valid_meal_type(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        allowed = {"breakfast", "lunch", "snack", "dinner", "late_night"}
+        if v not in allowed:
+            raise ValueError(f"meal_type must be one of: {sorted(allowed)}")
+        return v
+
+
+class FoodLogsResponse(BaseModel):
+    logs: list[FoodLogRead]
+    total: int
+
+
+# ── Voice Notes ────────────────────────────────────────────────────────────────
+
+class VoiceNoteRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    child_id: str
+    logged_at: datetime
+    client_local_hour: int | None
+    local_time_label: str | None
+    raw_text: str
+    sentences: list[str] = Field(default_factory=list)
+    preliminary_category: list[str] = Field(default_factory=list)
+    user_edited_text: str | None
+    user_edited_at: datetime | None
+    voided: bool
+    voided_at: datetime | None
+
+
+class VoiceNotesResponse(BaseModel):
+    notes: list[VoiceNoteRead]
+    total: int
+
+
+# ── Activity Abstractions ──────────────────────────────────────────────────────
+
+class AbstractionRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    child_id: str
+    log_date: date
+    generated_at: datetime
+    source_ids: dict[str, Any] = Field(default_factory=dict)
+    categories: dict[str, Any] = Field(default_factory=dict)
+    llm_summary: str | None
+    raw_sentences_kept: list[str] = Field(default_factory=list)
+    user_corrections: dict[str, Any] = Field(default_factory=dict)
+    version: int
+    is_current: bool
+
+
+class AbstractionGenerateRequest(BaseModel):
+    child_id: str = "default"
+    log_date: date
+
+
+class AbstractionPatchRequest(BaseModel):
+    """Dot-notation corrections, e.g. {"meltdowns.count": 2, "mood_arc.morning": "positive"}."""
+    corrections: dict[str, Any]
