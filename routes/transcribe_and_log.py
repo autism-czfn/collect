@@ -440,6 +440,35 @@ async def transcribe_and_log(
     if not transcription:
         raise HTTPException(status_code=422, detail="No speech detected in audio")
 
+    # ── Claude transcript cleanup (fix Whisper errors before further processing) ─
+    CLEANUP_PROMPT = (
+        "You are a transcript correction assistant. "
+        "The following text was produced by a speech-to-text engine and may contain "
+        "recognition errors, wrong homophones, missing punctuation, or garbled words. "
+        "The speaker is a caregiver describing a child's behaviour; they may mix "
+        "English and Chinese freely. "
+        "Fix ONLY genuine errors — wrong words, obvious mishearings, broken sentences. "
+        "Do NOT add new information, do NOT summarise, do NOT translate. "
+        "Return ONLY the corrected transcript text, nothing else.\n\n"
+        f"Transcript:\n{transcription}"
+    )
+    try:
+        cleanup_result = subprocess.run(
+            [
+                "claude", "-p",
+                "--disable-slash-commands",
+                CLEANUP_PROMPT,
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
+        if cleanup_result.returncode == 0 and cleanup_result.stdout.strip():
+            cleaned = cleanup_result.stdout.strip()
+            log.info(f"[cleanup] '{transcription[:60]}' → '{cleaned[:60]}'")
+            transcription = cleaned
+        else:
+            log.warning(f"[cleanup] skipped (rc={cleanup_result.returncode}): {cleanup_result.stderr.strip()}")
+    except Exception as e:
+        log.warning(f"[cleanup] skipped due to error: {e}")
     # ── raw mode: store verbatim sentences, skip LLM ─────────────────────────
     if mode == "raw":
         return await _handle_raw_mode(
